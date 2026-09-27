@@ -1,0 +1,7 @@
+name = "auto-blog-generator"
+main = "auto-blog-generator.js"
+compatibility_date = "2024-09-01"
+
+# Runs once every day at 3:00 AM UTC (8:30 AM IST).
+[triggers]
+crons = ["0 3 * * *"]
