@@ -7,15 +7,38 @@ export default {
   }
 }
 
+// Used whenever GNews has no fresh articles (common on the free plan,
+// which delays real-time results by up to 12 hours).
+const FALLBACK_TOPICS = [
+  "a breathtaking waterfall in India that most tourists don't know about",
+  "a hidden valley in the Himalayas perfect for trekking",
+  "an unexplored hill station in North East India",
+  "a mysterious cave system in India worth visiting",
+  "a stunning lake in India surrounded by mountains",
+  "an offbeat beach destination in India",
+  "a lesser-known wildlife sanctuary in India",
+  "a scenic road trip route through the Western Ghats",
+  "a breathtaking natural wonder outside India, like a waterfall, canyon, or fjord",
+  "an ancient forest or national park known for biodiversity",
+];
+
+async function getTopicTitle(env) {
+  try {
+    const newsRes = await fetch(`https://gnews.io/api/v4/search?q=travel&lang=en&max=10&token=${env.GNEWS_KEY}`);
+    const newsData = await newsRes.json();
+    if (newsData.articles && newsData.articles.length > 0) {
+      const pick = newsData.articles[Math.floor(Math.random() * newsData.articles.length)];
+      return pick.title;
+    }
+  } catch (e) {
+    // fall through to fallback list below
+  }
+  return FALLBACK_TOPICS[Math.floor(Math.random() * FALLBACK_TOPICS.length)];
+}
+
 async function generateAndPublish(env) {
   try {
-    const newsRes = await fetch(`https://gnews.io/api/v4/search?q=natural+wonders+travel+destination&lang=en&token=${env.GNEWS_KEY}`);
-    const newsData = await newsRes.json();
-    if (!newsData.articles || newsData.articles.length === 0) {
-      throw new Error(`GNews returned no articles: ${JSON.stringify(newsData)}`);
-    }
-    const topicNews = newsData.articles[Math.floor(Math.random() * newsData.articles.length)];
-    const topicTitle = topicNews.title;
+    const topicTitle = await getTopicTitle(env);
 
     const imgRes = await fetch(`https://api.pexels.com/v1/search?query=nature+landscape&per_page=1`, { headers: { Authorization: env.PEXELS_KEY } });
     const imgData = await imgRes.json();
