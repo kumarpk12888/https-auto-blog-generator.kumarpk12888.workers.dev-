@@ -1,4 +1,4 @@
-export default {
+export  {
   async fetch(request, env) {
     return await generateAndPublish(env);
   },
