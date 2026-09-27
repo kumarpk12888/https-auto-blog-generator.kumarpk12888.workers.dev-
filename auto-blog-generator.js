@@ -84,8 +84,4 @@ async function generateAndPublish(env) {
     });
 
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-}
+    return new Response(JSON.stringify({ er
