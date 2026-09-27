@@ -36,6 +36,38 @@ async function getTopicTitle(env) {
   return FALLBACK_TOPICS[Math.floor(Math.random() * FALLBACK_TOPICS.length)];
 }
 
+// Gemini sometimes returns 503 (temporary overload). Retry a few times
+// with a short delay, and fall back to the lighter flash-lite model if
+// the main flash model keeps failing.
+async function callGeminiWithRetry(env, prompt) {
+  const models = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
+  let lastError;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8000 } }),
+        }
+      );
+      const data = await res.json();
+      if (res.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
+        return data;
+      }
+      lastError = data;
+      if (data.error?.code === 503) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+      break; // non-503 error, no point retrying this model
+    }
+  }
+  return lastError;
+}
+
 async function generateAndPublish(env) {
   try {
     const topicTitle = await getTopicTitle(env);
@@ -46,12 +78,7 @@ async function generateAndPublish(env) {
 
     const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "article": "A complete 1200-1500 word English blog article in HTML format with <h2> subheadings, covering location details, best time to visit, attractions, travel tips, and a conclusion. Write in an engaging, descriptive tone."}`;
 
-    const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${env.GEMINI_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8000 } })
-    });
-    const geminiData = await geminiRes.json();
+    const geminiData = await callGeminiWithRetry(env, prompt);
     const candidate = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!candidate) {
       throw new Error(`Gemini returned no content: ${JSON.stringify(geminiData)}`);
