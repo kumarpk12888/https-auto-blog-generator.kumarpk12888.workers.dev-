@@ -98,7 +98,7 @@ const escAttr = (s) => String(s || "").replace(/"/g, "&quot;").replace(/</g, "&l
 async function searchPexels(env, query, count, page) {
   try {
     const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=${count}&orientation=landscape&page=${page}`;
-    const res = await fetch(url, { headers: { Authorization: env.PEXELS_KEY } });
+    const res = await fetch(url, { headers: { Authorization: (env.PEXELS_KEY || "").trim() } });
     if (!res.ok) return { images: [], error: `Pexels HTTP ${res.status}` };
     const data = await res.json();
     const images = (data.photos || [])
@@ -115,6 +115,38 @@ async function searchPexels(env, query, count, page) {
   }
 }
 
+// Re-host a Pexels image on ImgBB (ImgBB downloads it from the URL itself).
+// If ImgBB fails, the caller keeps the original Pexels URL so the post never loses its image.
+async function uploadToImgBB(env, imageUrl) {
+  try {
+    const key = (env.IMGBB_KEY || "").trim();
+    if (!key) return { url: null, error: "IMGBB_KEY missing" };
+    const form = new FormData();
+    form.append("image", imageUrl);
+    const res = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(key)}`, { method: "POST", body: form });
+    const data = await res.json().catch(() => ({}));
+    const url = data?.data?.url || data?.data?.display_url;
+    if (!res.ok || !url) return { url: null, error: `ImgBB HTTP ${res.status}` };
+    return { url, error: null };
+  } catch (e) {
+    return { url: null, error: `ImgBB failed: ${e.message}` };
+  }
+}
+
+async function hostImagesOnImgBB(env, images) {
+  let uploaded = 0;
+  let lastError = null;
+  const hosted = await Promise.all(
+    images.map(async (img) => {
+      const { url, error } = await uploadToImgBB(env, img.url);
+      if (url) { uploaded++; return { ...img, url }; }
+      lastError = error;
+      return img; // fallback: keep Pexels URL
+    })
+  );
+  return { images: hosted, uploaded, error: lastError };
+}
+
 // Try the topic-specific query first, then progressively safer fallbacks,
 // so the post always ends up with images.
 async function getImagesForPost(env, imageQuery, count) {
@@ -128,7 +160,13 @@ async function getImagesForPost(env, imageQuery, count) {
   for (const a of attempts) {
     if (!a.q) continue;
     const { images, error } = await searchPexels(env, a.q, count, a.page);
-    if (images.length) return { images, status: `ok (query: ${a.q})` };
+    if (images.length) {
+      const hosted = await hostImagesOnImgBB(env, images);
+      const host = hosted.uploaded === images.length
+        ? "imgbb ok"
+        : `imgbb ${hosted.uploaded}/${images.length}${hosted.error ? " (" + hosted.error + ")" : ""}`;
+      return { images: hosted.images, status: `ok (query: ${a.q}, ${host})` };
+    }
     if (error) lastError = error;
   }
   return { images: [], status: lastError || "no images found" };
