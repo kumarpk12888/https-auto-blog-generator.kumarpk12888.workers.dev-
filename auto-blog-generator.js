@@ -7,9 +7,9 @@ export default {
   }
 }
 
-// Used whenever GNews has no fresh articles (common on the free plan,
-// which delays real-time results by up to 12 hours).
-const FALLBACK_TOPICS = [
+// Fixed nature/travel topic pool (GNews removed so posts always stay on-topic).
+// Add or remove topics anytime.
+const TOPICS = [
   "a breathtaking waterfall in India that most tourists don't know about",
   "a hidden valley in the Himalayas perfect for trekking",
   "an unexplored hill station in North East India",
@@ -20,20 +20,20 @@ const FALLBACK_TOPICS = [
   "a scenic road trip route through the Western Ghats",
   "a breathtaking natural wonder outside India, like a waterfall, canyon, or fjord",
   "an ancient forest or national park known for biodiversity",
+  "a high-altitude trek in Uttarakhand or Himachal Pradesh",
+  "a spectacular river gorge or canyon in India",
+  "a serene backwater or wetland destination in India",
+  "a desert landscape with unique natural formations",
+  "a volcanic landscape or hot spring destination",
+  "a beautiful alpine meadow or bugyal in the Indian Himalayas",
+  "a lesser-known national park in Central India known for tigers or birds",
+  "a spectacular sunrise or sunset viewpoint in the mountains",
+  "a glacier or snow-covered destination worth visiting",
+  "a coastal cliff or island destination with pristine nature",
 ];
 
-async function getTopicTitle(env) {
-  try {
-    const newsRes = await fetch(`https://gnews.io/api/v4/search?q=travel&lang=en&max=10&token=${env.GNEWS_KEY}`);
-    const newsData = await newsRes.json();
-    if (newsData.articles && newsData.articles.length > 0) {
-      const pick = newsData.articles[Math.floor(Math.random() * newsData.articles.length)];
-      return pick.title;
-    }
-  } catch (e) {
-    // fall through to fallback list below
-  }
-  return FALLBACK_TOPICS[Math.floor(Math.random() * FALLBACK_TOPICS.length)];
+function getTopicTitle() {
+  return TOPICS[Math.floor(Math.random() * TOPICS.length)];
 }
 
 // Gemini sometimes returns 503 (temporary overload). Retry a few times
@@ -70,13 +70,13 @@ async function callGeminiWithRetry(env, prompt) {
 
 async function generateAndPublish(env) {
   try {
-    const topicTitle = await getTopicTitle(env);
+    const topicTitle = getTopicTitle();
 
     const imgRes = await fetch(`https://api.pexels.com/v1/search?query=nature+landscape&per_page=1`, { headers: { Authorization: env.PEXELS_KEY } });
     const imgData = await imgRes.json();
     const imageUrl = imgData.photos?.[0]?.src?.large || "";
 
-    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "article": "A complete 1200-1500 word English blog article in HTML format with <h2> subheadings, covering location details, best time to visit, attractions, travel tips, and a conclusion. Write in an engaging, descriptive tone."}`;
+    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "article": "A complete 1200-1500 word English blog article in HTML format with <h2> subheadings, covering location details, best time to visit, attractions, travel tips, and a conclusion. Write in an engaging, descriptive tone."}`;
 
     const geminiData = await callGeminiWithRetry(env, prompt);
     const candidate = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -101,11 +101,14 @@ async function generateAndPublish(env) {
       throw new Error(`Token refresh failed: ${JSON.stringify(tokenData)}`);
     }
 
+    const safeAlt = String(parsed.title).replace(/"/g, "");
+    const labels = Array.isArray(parsed.labels) ? parsed.labels.slice(0, 5) : ["Nature", "Travel"];
     const postBody = {
       kind: "blogger#post",
       title: parsed.title,
-      content: imageUrl ? `<img src="${imageUrl}" style="width:100%;border-radius:8px;"/><br><br>${parsed.article}` : parsed.article,
-      searchDescription: parsed.meta_description
+      labels: labels,
+      searchDescription: String(parsed.meta_description).slice(0, 150),
+      content: (imageUrl ? `<img src="${imageUrl}" alt="${safeAlt}" style="width:100%;border-radius:8px;"/><br><br>` : "") + `<p><em>${parsed.meta_description}</em></p>` + parsed.article,
     };
 
     const publishRes = await fetch(`https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts/`, {
