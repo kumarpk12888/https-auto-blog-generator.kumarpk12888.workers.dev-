@@ -1,4 +1,4 @@
-const POSTS_PER_CRON_RUN = 3;
+const POSTS_PER_CRON_RUN = 1;
 
 export default {
   // Visiting the URL publishes only 1 post (for testing).
