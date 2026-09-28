@@ -1,9 +1,21 @@
+const POSTS_PER_CRON_RUN = 3;
+
 export default {
+  // Visiting the URL publishes only 1 post (for testing).
   async fetch(request, env) {
-    return await generateAndPublish(env);
+    return await generateAndPublish(env, getTopicTitle());
   },
+  // Cron run publishes 3 posts, each with a different topic.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(generateAndPublish(env));
+    ctx.waitUntil(runBatch(env));
+  }
+}
+
+async function runBatch(env) {
+  const topics = pickDistinctTopics(POSTS_PER_CRON_RUN);
+  for (const topic of topics) {
+    const res = await generateAndPublish(env, topic);
+    console.log(await res.text());
   }
 }
 
@@ -36,6 +48,15 @@ function getTopicTitle() {
   return TOPICS[Math.floor(Math.random() * TOPICS.length)];
 }
 
+function pickDistinctTopics(n) {
+  const pool = [...TOPICS];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, n);
+}
+
 // Gemini sometimes returns 503 (temporary overload). Retry a few times
 // with a short delay, and fall back to the lighter flash-lite model if
 // the main flash model keeps failing.
@@ -50,7 +71,7 @@ async function callGeminiWithRetry(env, prompt) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8000 } }),
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 16000 } }),
         }
       );
       const data = await res.json();
@@ -68,15 +89,14 @@ async function callGeminiWithRetry(env, prompt) {
   return lastError;
 }
 
-async function generateAndPublish(env) {
+async function generateAndPublish(env, topicTitle) {
   try {
-    const topicTitle = getTopicTitle();
 
-    const imgRes = await fetch(`https://api.pexels.com/v1/search?query=nature+landscape&per_page=1`, { headers: { Authorization: env.PEXELS_KEY } });
+    const imgRes = await fetch(`https://api.pexels.com/v1/search?query=nature+landscape&per_page=1&page=${Math.floor(Math.random() * 40) + 1}`, { headers: { Authorization: env.PEXELS_KEY } });
     const imgData = await imgRes.json();
     const imageUrl = imgData.photos?.[0]?.src?.large || "";
 
-    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "article": "A complete 1200-1500 word English blog article in HTML format with <h2> subheadings, covering location details, best time to visit, attractions, travel tips, and a conclusion. Write in an engaging, descriptive tone."}`;
+    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
 
     const geminiData = await callGeminiWithRetry(env, prompt);
     const candidate = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
