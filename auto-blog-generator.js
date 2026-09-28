@@ -203,10 +203,36 @@ function injectInlineImages(articleHtml, images, fallbackAlt) {
 
 // ---------- MAIN ----------
 
+// Location map for the post.
+// 1) With GEOAPIFY_KEY secret: Geoapify geocoding + static map image (free plan, no JS needed).
+// 2) Fallback (no key / any error): keyless Google Maps embed.
+async function mapHtml(env, placeName) {
+  const place = String(placeName || "").trim();
+  if (!place) return "";
+  const safe = place.replace(/"/g, "");
+  const gLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}`;
+  const key = (env.GEOAPIFY_KEY || "").trim();
+
+  if (key) {
+    try {
+      const geo = await fetch(`https://api.geoapify.com/v1/geocode/search?text=${encodeURIComponent(place)}&limit=1&format=json&apiKey=${encodeURIComponent(key)}`);
+      const gd = await geo.json();
+      const r = gd.results && gd.results[0];
+      if (geo.ok && r && typeof r.lat === "number" && typeof r.lon === "number") {
+        const img = `https://maps.geoapify.com/v1/staticmap?style=osm-bright&width=800&height=420&center=lonlat:${r.lon},${r.lat}&zoom=9&marker=lonlat:${r.lon},${r.lat};type:awesome;color:%23e53935;size:large&apiKey=${encodeURIComponent(key)}`;
+        return `<h2>Location Map: ${safe}</h2><div style="margin:20px 0;text-align:center"><a href="${gLink}" target="_blank" rel="noopener"><img src="${img}" alt="Map of ${safe}" style="width:100%;max-width:800px;border-radius:10px" loading="lazy"></a><p><a href="${gLink}" target="_blank" rel="noopener">Open ${safe} in Google Maps</a></p></div>`;
+      }
+    } catch (e) {}
+  }
+
+  const src = `https://maps.google.com/maps?q=${encodeURIComponent(place)}&output=embed`;
+  return `<h2>Location Map: ${safe}</h2><div style="margin:20px 0"><iframe width="100%" height="380" style="border:0;border-radius:10px" loading="lazy" allowfullscreen referrerpolicy="no-referrer-when-downgrade" src="${src}" title="Map of ${safe}"></iframe></div>`;
+}
+
 async function generateAndPublish(env, topicTitle) {
   try {
     // 1) Write the article first, so Gemini can also tell us what photos to search for.
-    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
+    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
 
     const geminiData = await callGeminiWithRetry(env, prompt);
     const candidate = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -248,7 +274,7 @@ async function generateAndPublish(env, topicTitle) {
       title: parsed.title,
       labels: labels,
       searchDescription: String(parsed.meta_description).slice(0, 150),
-      content: heroHtml + `<p><em>${parsed.meta_description}</em></p>` + articleWithImages,
+      content: heroHtml + `<p><em>${parsed.meta_description}</em></p>` + articleWithImages + (await mapHtml(env, parsed.place_name)),
     };
 
     const publishRes = await fetch(`https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts/`, {
