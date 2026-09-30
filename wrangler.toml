@@ -3,4 +3,4 @@ main = "auto-blog-generator.js"
 compatibility_date = "2024-09-01"
 
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["0 */6 * * *"]
