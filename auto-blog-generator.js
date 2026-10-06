@@ -290,7 +290,7 @@ async function getBloggerToken(env) {
 async function getRecentTitles(env, accessToken) {
   try {
     const res = await fetch(
-      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(title,url,labels)`,
+      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(id,title,url,labels)`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -316,6 +316,50 @@ function relatedPostsHtml(existing, newLabels, count) {
     .map((p) => `<li style="margin:6px 0;"><a href="${p.url}">${escAttr(p.title)}</a></li>`)
     .join("");
   return `<h2>Read More Nature &amp; Travel Guides</h2><ul>${items}</ul>`;
+}
+
+// Two-way linking: add the NEW post's link into 2 related OLD posts
+// (inside a small "Latest from our blog" box, newest first, max 3 links per box).
+async function backlinkOldPosts(env, accessToken, existing, newLabels, newTitle, newUrl) {
+  const done = [];
+  try {
+    if (!newUrl || !existing.length) return done;
+    const want = new Set((newLabels || []).map((l) => String(l).toLowerCase()));
+    const targets = existing
+      .filter((p) => p.id)
+      .map((p) => ({ p, score: (p.labels || []).filter((l) => want.has(String(l).toLowerCase())).length + Math.random() * 0.5 }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map((x) => x.p);
+
+    const newLi = `<li style="margin:6px 0;"><a href="${newUrl}">${escAttr(newTitle)}</a></li>`;
+    for (const t of targets) {
+      try {
+        const base = `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts/${t.id}`;
+        const auth = { Authorization: `Bearer ${accessToken}` };
+        const gr = await fetch(`${base}?fields=content`, { headers: auth });
+        if (!gr.ok) continue;
+        const content = (await gr.json()).content || "";
+        if (content.includes(newUrl)) continue;
+
+        const boxRe = /<div class="latest-links"[^>]*>[\s\S]*?<\/div>/i;
+        const m = content.match(boxRe);
+        let oldLis = [];
+        if (m) oldLis = m[0].match(/<li[\s\S]*?<\/li>/gi) || [];
+        const lis = [newLi, ...oldLis].slice(0, 3).join("");
+        const box = `<div class="latest-links" style="margin-top:28px;padding:14px;border:1px solid #ddd;border-radius:8px;"><h3 style="margin-top:0;">Latest from our blog</h3><ul>${lis}</ul></div>`;
+        const updated = m ? content.replace(boxRe, box) : content + box;
+
+        const pr = await fetch(base, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ content: updated }),
+        });
+        if (pr.ok) done.push(t.title);
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return done;
 }
 
 // True if the new place/title is already covered by an existing post title.
@@ -409,12 +453,15 @@ async function generateAndPublish(env, topicTitle) {
       throw new Error(`Blogger publish failed: ${JSON.stringify(publishData)}`);
     }
 
+    const backlinked = await backlinkOldPosts(env, accessToken, existingPosts, labels, parsed.title, publishData.url);
+
     return new Response(JSON.stringify({
       status: "success",
       published_title: parsed.title,
       post_url: publishData.url || "check Blogger dashboard",
       images_used: images.length,
       image_status: imageStatus,
+      backlinked_old_posts: backlinked,
     }, null, 2), { headers: { "Content-Type": "application/json" } });
   } catch (err) {
     return new Response(JSON.stringify({ status: "error", error: err.message }, null, 2), { status: 500, headers: { "Content-Type": "application/json" } });
