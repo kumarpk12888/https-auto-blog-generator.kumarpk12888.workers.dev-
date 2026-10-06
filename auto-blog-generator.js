@@ -290,15 +290,32 @@ async function getBloggerToken(env) {
 async function getRecentTitles(env, accessToken) {
   try {
     const res = await fetch(
-      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(title)`,
+      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(title,url,labels)`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
     const d = await res.json();
-    return (d.items || []).map((p) => p.title).filter(Boolean);
+    return (d.items || []).filter((p) => p.title && p.url);
   } catch (e) {
     return [];
   }
+}
+
+// Auto internal links: "Read More" block with the most relevant older posts
+// (same labels first, then random fill). Links come from Blogger itself, so they are always real.
+function relatedPostsHtml(existing, newLabels, count) {
+  if (!existing.length) return "";
+  const want = new Set((newLabels || []).map((l) => String(l).toLowerCase()));
+  const scored = existing.map((p) => ({
+    p,
+    score: (p.labels || []).filter((l) => want.has(String(l).toLowerCase())).length + Math.random() * 0.5,
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  const chosen = scored.slice(0, count).map((x) => x.p);
+  const items = chosen
+    .map((p) => `<li style="margin:6px 0;"><a href="${p.url}">${escAttr(p.title)}</a></li>`)
+    .join("");
+  return `<h2>Read More Nature &amp; Travel Guides</h2><ul>${items}</ul>`;
 }
 
 // True if the new place/title is already covered by an existing post title.
@@ -315,7 +332,8 @@ async function generateAndPublish(env, topicTitle) {
   try {
     // 0) Blogger token + already-published titles (so Gemini never repeats a place).
     const accessToken = await getBloggerToken(env);
-    const usedTitles = await getRecentTitles(env, accessToken);
+    const existingPosts = await getRecentTitles(env, accessToken);
+    const usedTitles = existingPosts.map((p) => p.title);
     const avoid = [];
 
     // 1) Write the article first, so Gemini can also tell us what photos to search for.
@@ -378,7 +396,7 @@ async function generateAndPublish(env, topicTitle) {
       title: parsed.title,
       labels: labels,
       searchDescription: String(parsed.meta_description).slice(0, 150),
-      content: heroHtml + `<p><em>${parsed.meta_description}</em></p>` + articleWithImages + (await mapHtml(env, parsed.place_name)),
+      content: heroHtml + `<p><em>${parsed.meta_description}</em></p>` + articleWithImages + relatedPostsHtml(existingPosts, labels, 4) + (await mapHtml(env, parsed.place_name)),
     };
 
     const publishRes = await fetch(`https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts/`, {
