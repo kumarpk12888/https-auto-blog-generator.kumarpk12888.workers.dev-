@@ -63,6 +63,7 @@ function pickDistinctTopics(n) {
 async function callGeminiWithRetry(env, prompt) {
   const models = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
   let lastError;
+  let useThinkingCfg = true; // turned off automatically if the model rejects it
 
   const schema = {
     type: "OBJECT",
@@ -88,8 +89,10 @@ async function callGeminiWithRetry(env, prompt) {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
               maxOutputTokens: 32000,
+              temperature: 1.0,
               responseMimeType: "application/json",
               responseSchema: schema,
+              ...(useThinkingCfg ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
             },
           }),
         }
@@ -101,6 +104,11 @@ async function callGeminiWithRetry(env, prompt) {
         return { text, finishReason: data.candidates?.[0]?.finishReason };
       }
       lastError = data;
+      if (data.error?.code === 400 && useThinkingCfg && /think/i.test(data.error?.message || "")) {
+        useThinkingCfg = false; // model does not accept thinkingConfig, retry without it
+        attempt--;
+        continue;
+      }
       if (data.error?.code === 503 || data.error?.code === 429) {
         await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
@@ -251,31 +259,107 @@ async function mapHtml(env, placeName) {
   return `<h2>Location Map: ${safe}</h2><div style="margin:20px 0"><iframe width="100%" height="380" style="border:0;border-radius:10px" loading="lazy" allowfullscreen referrerpolicy="no-referrer-when-downgrade" src="${src}" title="Map of ${safe}"></iframe></div>`;
 }
 
+// ---------- NO-REPEAT HELPERS ----------
+
+const REGIONS = [
+  "Kerala", "Karnataka", "Tamil Nadu", "Andhra Pradesh", "Telangana", "Maharashtra", "Goa", "Gujarat",
+  "Rajasthan", "Madhya Pradesh", "Chhattisgarh", "Odisha", "West Bengal", "Sikkim", "Assam", "Meghalaya",
+  "Arunachal Pradesh", "Nagaland", "Manipur", "Mizoram", "Tripura", "Uttarakhand", "Himachal Pradesh",
+  "Jammu and Kashmir", "Ladakh", "Jharkhand", "Bihar", "Uttar Pradesh", "Andaman and Nicobar",
+];
+const ANGLES = [
+  "hidden history and legends", "trekking and adventure guide", "budget travel plan", "best season and weather guide",
+  "photography spots and sunrise views", "family trip itinerary", "local culture and food nearby", "offbeat facts most tourists miss",
+];
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+async function getBloggerToken(env) {
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: env.CLIENT_ID, client_secret: env.CLIENT_SECRET, refresh_token: env.REFRESH_TOKEN, grant_type: "refresh_token" })
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenData.access_token) {
+    throw new Error(`Token refresh failed: ${JSON.stringify(tokenData)}`);
+  }
+  return tokenData.access_token;
+}
+
+// Titles already published on this blog (read straight from Blogger, no KV needed).
+async function getRecentTitles(env, accessToken) {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(title)`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    const d = await res.json();
+    return (d.items || []).map((p) => p.title).filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
+// True if the new place/title is already covered by an existing post title.
+function isDuplicate(parsed, usedTitles) {
+  const place = String(parsed.place_name || "").split(",")[0].trim().toLowerCase();
+  const title = String(parsed.title || "").trim().toLowerCase();
+  return usedTitles.some((t) => {
+    const u = String(t).toLowerCase();
+    return u === title || (place.length > 3 && u.includes(place));
+  });
+}
+
 async function generateAndPublish(env, topicTitle) {
   try {
-    // 1) Write the article first, so Gemini can also tell us what photos to search for.
-    const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
+    // 0) Blogger token + already-published titles (so Gemini never repeats a place).
+    const accessToken = await getBloggerToken(env);
+    const usedTitles = await getRecentTitles(env, accessToken);
+    const avoid = [];
 
+    // 1) Write the article first, so Gemini can also tell us what photos to search for.
     let parsed;
     let lastInfo = "";
-    for (let tryNo = 1; tryNo <= 2; tryNo++) {
+    for (let tryNo = 1; tryNo <= 3; tryNo++) {
+      const region = pick(REGIONS);
+      const angle = pick(ANGLES);
+      const seed = Math.floor(Math.random() * 1000000);
+      const extra = `\n\nIMPORTANT - AVOID REPEATS: These posts are already published, so you MUST choose a DIFFERENT place (not one of these, and not the same place with a new title):\n${[...usedTitles, ...avoid].slice(0, 120).join(" | ") || "(none yet)"}\nPick a lesser-known place, preferably around: ${region} (ignore this hint if the topic says outside India). Writing angle: ${angle}. Variation seed: ${seed}.`;
+
+      const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post.${extra} Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
+
       const g = await callGeminiWithRetry(env, prompt);
       if (!g.text) {
         throw new Error(`Gemini returned no content: ${JSON.stringify(g.error)}`);
       }
+      // Cut-off answer (token limit etc.) -> try again instead of parsing half JSON.
+      if (g.finishReason && g.finishReason !== "STOP") {
+        lastInfo = `finish=${g.finishReason} (answer cut off), len=${g.text.length}`;
+        continue;
+      }
       const raw = g.text.replace(/```json|```/g, "").trim();
+      let candidate;
       try {
-        parsed = JSON.parse(raw);
-        if (parsed.article && parsed.title) break;
-        lastInfo = "missing fields";
-        parsed = null;
+        candidate = JSON.parse(raw);
       } catch (e) {
         lastInfo = `finish=${g.finishReason}, len=${raw.length}, start=${raw.slice(0, 150)}, END=${raw.slice(-200)}`;
-        parsed = null;
+        continue;
       }
+      if (!candidate.article || !candidate.title) {
+        lastInfo = "missing fields";
+        continue;
+      }
+      if (isDuplicate(candidate, usedTitles)) {
+        avoid.push(`${candidate.title} (${candidate.place_name})`);
+        lastInfo = `duplicate place: ${candidate.place_name}`;
+        continue;
+      }
+      parsed = candidate;
+      break;
     }
     if (!parsed) {
-      throw new Error(`Failed to parse Gemini JSON after 2 tries: ${lastInfo}`);
+      throw new Error(`Could not get a valid NEW article after 3 tries: ${lastInfo}`);
     }
 
     // 2) Fetch topic-matched images (1 hero + up to 3 inline).
@@ -283,17 +367,6 @@ async function generateAndPublish(env, topicTitle) {
     const safeTitle = String(parsed.title).replace(/"/g, "");
     const hero = images[0];
     const inlineImages = images.slice(1);
-
-    // 3) Blogger access token.
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ client_id: env.CLIENT_ID, client_secret: env.CLIENT_SECRET, refresh_token: env.REFRESH_TOKEN, grant_type: "refresh_token" })
-    });
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      throw new Error(`Token refresh failed: ${JSON.stringify(tokenData)}`);
-    }
 
     // 4) Build post: hero image on top, inline images inside the article.
     const labels = Array.isArray(parsed.labels) ? parsed.labels.slice(0, 5) : ["Nature", "Travel"];
@@ -310,7 +383,7 @@ async function generateAndPublish(env, topicTitle) {
 
     const publishRes = await fetch(`https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts/`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${tokenData.access_token}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify(postBody)
     });
     const publishData = await publishRes.json();
