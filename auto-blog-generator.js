@@ -57,12 +57,25 @@ function pickDistinctTopics(n) {
   return pool.slice(0, n);
 }
 
-// Gemini sometimes returns 503 (temporary overload). Retry a few times
-// with a short delay, and fall back to the lighter flash-lite model if
-// the main flash model keeps failing.
+// Gemini sometimes returns 503/429 (temporary overload). Retry a few times,
+// and fall back to the lighter flash-lite model if the main model keeps failing.
+// JSON mode + schema guarantees valid JSON (no broken quotes/newlines in HTML).
 async function callGeminiWithRetry(env, prompt) {
   const models = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
   let lastError;
+
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      title: { type: "STRING" },
+      meta_description: { type: "STRING" },
+      place_name: { type: "STRING" },
+      labels: { type: "ARRAY", items: { type: "STRING" } },
+      image_query: { type: "STRING" },
+      article: { type: "STRING" },
+    },
+    required: ["title", "meta_description", "place_name", "labels", "image_query", "article"],
+  };
 
   for (const model of models) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -71,22 +84,31 @@ async function callGeminiWithRetry(env, prompt) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 16000 } }),
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              maxOutputTokens: 32000,
+              responseMimeType: "application/json",
+              responseSchema: schema,
+            },
+          }),
         }
       );
       const data = await res.json();
-      if (res.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
-        return data;
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const text = parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
+      if (res.ok && text) {
+        return { text, finishReason: data.candidates?.[0]?.finishReason };
       }
       lastError = data;
-      if (data.error?.code === 503) {
+      if (data.error?.code === 503 || data.error?.code === 429) {
         await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
       }
-      break; // non-503 error, no point retrying this model
+      break; // other error, no point retrying this model
     }
   }
-  return lastError;
+  return { error: lastError };
 }
 
 // ---------- IMAGE HELPERS ----------
@@ -234,17 +256,26 @@ async function generateAndPublish(env, topicTitle) {
     // 1) Write the article first, so Gemini can also tell us what photos to search for.
     const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post. Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
 
-    const geminiData = await callGeminiWithRetry(env, prompt);
-    const candidate = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!candidate) {
-      throw new Error(`Gemini returned no content: ${JSON.stringify(geminiData)}`);
-    }
-    let rawText = candidate.replace(/```json|```/g, "").trim();
     let parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (e) {
-      throw new Error(`Failed to parse Gemini JSON: ${rawText.slice(0, 500)}`);
+    let lastInfo = "";
+    for (let tryNo = 1; tryNo <= 2; tryNo++) {
+      const g = await callGeminiWithRetry(env, prompt);
+      if (!g.text) {
+        throw new Error(`Gemini returned no content: ${JSON.stringify(g.error)}`);
+      }
+      const raw = g.text.replace(/```json|```/g, "").trim();
+      try {
+        parsed = JSON.parse(raw);
+        if (parsed.article && parsed.title) break;
+        lastInfo = "missing fields";
+        parsed = null;
+      } catch (e) {
+        lastInfo = `finish=${g.finishReason}, len=${raw.length}, start=${raw.slice(0, 150)}, END=${raw.slice(-200)}`;
+        parsed = null;
+      }
+    }
+    if (!parsed) {
+      throw new Error(`Failed to parse Gemini JSON after 2 tries: ${lastInfo}`);
     }
 
     // 2) Fetch topic-matched images (1 hero + up to 3 inline).
