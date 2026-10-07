@@ -256,18 +256,29 @@ async function hostImagesOnImgBB(env, images) {
   return { images: hosted, uploaded, error: lastError };
 }
 
-// Try the topic-specific query first, then progressively safer fallbacks,
-// so the post always ends up with images.
-async function getImagesForPost(env, imageQuery, count) {
+// Image search order (most accurate first):
+// 1) the real place name (e.g. "Kumta Beach Karnataka") so the photos match the destination,
+// 2) the generic scenery phrase from Gemini, 3) a safe "nature landscape" fallback.
+// Generic phrases alone ("coastal trek") were returning unrelated photos (e.g. a temple).
+async function getImagesForPost(env, imageQuery, count, placeName) {
+  const parts = String(placeName || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const placeShort = parts[0] || "";
+  const placeState = parts.slice(0, 2).join(" ");
   const attempts = [
-    { q: imageQuery, page: Math.floor(Math.random() * 2) + 1 },
+    { q: placeState, page: 1 },
+    { q: placeShort, page: 1 },
     { q: imageQuery, page: 1 },
+    { q: imageQuery, page: 2 },
     { q: "nature landscape", page: Math.floor(Math.random() * 10) + 1 },
     { q: "nature landscape", page: 1 },
   ];
+  const tried = new Set();
   let lastError = null;
   for (const a of attempts) {
     if (!a.q) continue;
+    const key = a.q + "|" + a.page;
+    if (tried.has(key)) continue;
+    tried.add(key);
     const { images, error } = await searchPexels(env, a.q, count, a.page);
     if (images.length) {
       const hosted = await hostImagesOnImgBB(env, images);
@@ -520,7 +531,7 @@ async function generateAndPublish(env, topicTitle, opts = {}) {
     }
 
     // 2) Fetch topic-matched images (1 hero + up to 3 inline).
-    const { images, status: imageStatus } = await getImagesForPost(env, parsed.image_query, 4);
+    const { images, status: imageStatus } = await getImagesForPost(env, parsed.image_query, 4, parsed.place_name);
     const safeTitle = String(parsed.title).replace(/"/g, "");
     const hero = images[0];
     const inlineImages = images.slice(1);
