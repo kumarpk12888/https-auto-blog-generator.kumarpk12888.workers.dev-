@@ -77,25 +77,30 @@ function pickDistinctTopics(n) {
   return pool.slice(0, n);
 }
 
-// Gemini sometimes returns 503/429 (temporary overload). Retry a few times,
+// Gemini sometimes returns 503/429/524 (temporary overload or timeout). Retry a few times,
 // and fall back to the lighter flash-lite model if the main model keeps failing.
-// JSON mode + schema guarantees valid JSON (no broken quotes/newlines in HTML).
-async function callGeminiWithRetry(env, prompt) {
+// opts: { schema } -> JSON mode with schema, otherwise plain text. { maxTokens }.
+const META_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    title: { type: "STRING" },
+    meta_description: { type: "STRING" },
+    place_name: { type: "STRING" },
+    labels: { type: "ARRAY", items: { type: "STRING" } },
+    image_query: { type: "STRING" },
+  },
+  required: ["title", "meta_description", "place_name", "labels", "image_query"],
+};
+
+async function callGeminiWithRetry(env, prompt, opts = {}) {
   const models = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
   let lastError;
 
-  const schema = {
-    type: "OBJECT",
-    properties: {
-      title: { type: "STRING" },
-      meta_description: { type: "STRING" },
-      place_name: { type: "STRING" },
-      labels: { type: "ARRAY", items: { type: "STRING" } },
-      image_query: { type: "STRING" },
-      article: { type: "STRING" },
-    },
-    required: ["title", "meta_description", "place_name", "labels", "image_query", "article"],
-  };
+  const generationConfig = { maxOutputTokens: opts.maxTokens || 8000, temperature: 1.0 };
+  if (opts.schema) {
+    generationConfig.responseMimeType = "application/json";
+    generationConfig.responseSchema = opts.schema;
+  }
 
   for (const model of models) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -106,15 +111,7 @@ async function callGeminiWithRetry(env, prompt) {
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: {
-                maxOutputTokens: 16000,
-                temperature: 1.0,
-                responseMimeType: "application/json",
-                responseSchema: schema,
-              },
-            }),
+            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig }),
           }
         );
         // Read as text first: timeouts like "error code: 524" are NOT JSON.
@@ -145,6 +142,60 @@ async function callGeminiWithRetry(env, prompt) {
     }
   }
   return { error: lastError };
+}
+
+// ---------- ARTICLE WRITER (3 short requests in parallel = no timeout, still 2000+ words) ----------
+// Each part has a minimum word count. The minimums add up to MORE than 2000 words,
+// so if every part passes, the article is always 2000+ words.
+const ARTICLE_PARTS = [
+  {
+    min: 680, target: 850,
+    sections: "1) Introduction (hook the reader, why this place is special); 2) Location and How to Reach (by air, rail, road, nearest town, distances); 3) Best Time to Visit (season by season, weather, what to avoid)",
+  },
+  {
+    min: 760, target: 950,
+    sections: "1) Top Attractions (use several <h3> sub-items, each with its own detailed paragraph); 2) Things to Do (activities, treks, photography, wildlife, experiences); 3) Hidden Gems and Offbeat Tips",
+  },
+  {
+    min: 800, target: 1000,
+    sections: "1) Local Culture and Food; 2) Where to Stay (types of stays, areas, booking advice); 3) Budget and Packing Tips; 4) Safety and Responsible Travel; 5) Conclusion",
+  },
+];
+
+const countWords = (html) => String(html || "").replace(/<[^>]*>/g, " ").split(/\s+/).filter(Boolean).length;
+
+async function writeArticlePart(env, meta, angle, part, index) {
+  let lastInfo = "";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const note = attempt > 1 ? ` The previous attempt was too short (${lastInfo}). Be much more detailed and write at least ${part.target} words.` : "";
+    const prompt = `You are writing PART ${index + 1} of ${ARTICLE_PARTS.length} of one long English travel blog article about "${meta.place_name}" (post title: "${meta.title}"). Writing angle: ${angle}.
+Write ONLY these sections, each as an <h2> heading followed by rich, detailed <p> paragraphs: ${part.sections}.
+Rules: write at least ${part.target} words in this part (the full article must be over 2000 words). Output HTML only, using <h2>, <h3>, <p>, <ul>, <li>, <strong>. No <html>, <body> or <h1> tags, no markdown code fences, no title, and no text outside the sections. Do not repeat content that belongs to other parts. Engaging, descriptive tone. Do not invent exact prices, phone numbers or timings; keep them approximate.${note}`;
+    const g = await callGeminiWithRetry(env, prompt, { maxTokens: 8000 });
+    if (!g.text) {
+      lastInfo = `gemini error ${JSON.stringify(g.error).slice(0, 150)}`;
+      continue;
+    }
+    if (g.finishReason && g.finishReason !== "STOP") {
+      lastInfo = `finish=${g.finishReason}`;
+      continue;
+    }
+    const html = g.text.replace(/```html|```/g, "").trim();
+    const words = countWords(html);
+    if (words >= part.min) return { html, words };
+    lastInfo = `${words} words`;
+  }
+  return { html: "", words: 0, info: `part ${index + 1}: ${lastInfo}` };
+}
+
+async function writeArticle(env, meta, angle) {
+  const results = await Promise.all(ARTICLE_PARTS.map((part, i) => writeArticlePart(env, meta, angle, part, i)));
+  const failed = results.find((r) => !r.html);
+  if (failed) return { html: "", info: failed.info };
+  const html = results.map((r) => r.html).join("\n");
+  const words = results.reduce((n, r) => n + r.words, 0);
+  if (words < 2000) return { html: "", info: `only ${words} words` };
+  return { html, words };
 }
 
 // ---------- IMAGE HELPERS ----------
@@ -424,7 +475,7 @@ async function generateAndPublish(env, topicTitle, opts = {}) {
       }
     }
 
-    // 1) Write the article first, so Gemini can also tell us what photos to search for.
+    // 1) Plan the post (short JSON), check it is a NEW place, then write the 2000+ word article in parts.
     let parsed;
     let lastInfo = "";
     for (let tryNo = 1; tryNo <= 3; tryNo++) {
@@ -433,35 +484,34 @@ async function generateAndPublish(env, topicTitle, opts = {}) {
       const seed = Math.floor(Math.random() * 1000000);
       const extra = `\n\nIMPORTANT - AVOID REPEATS: These posts are already published, so you MUST choose a DIFFERENT place (not one of these, and not the same place with a new title):\n${[...usedTitles, ...avoid].slice(0, 120).join(" | ") || "(none yet)"}\nPick a lesser-known place, preferably around: ${region} (ignore this hint if the topic says outside India). Writing angle: ${angle}. Variation seed: ${seed}.`;
 
-      const prompt = `Based on this topic: "${topicTitle}", write a nature/travel blog post.${extra} Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names", "article": "A complete, detailed English blog article of at least 2000 words (aim for 2000-2300) in HTML format. Use at least 8 <h2> sections covering: introduction, location and how to reach, best time to visit, top attractions (with several <h3> items), things to do, local culture and food, where to stay, budget and packing tips, safety and responsible travel, and a conclusion. Do not stop early or summarize. Write in an engaging, descriptive tone."}`;
+      const metaPrompt = `Based on this topic: "${topicTitle}", plan a nature/travel blog post.${extra} Return STRICT JSON only, no extra text, no markdown fences: {"title": "SEO-friendly catchy title under 70 characters", "meta_description": "SEO meta description under 160 characters", "place_name": "the exact main place or destination name with state and country for a Google Maps search, e.g. Ziro Valley, Arunachal Pradesh, India", "labels": ["4 to 5 short SEO keyword labels, e.g. Waterfalls, India Travel, Trekking"], "image_query": "a 2 to 4 word English stock-photo search phrase describing the main scenery of this topic, using generic visual words only (e.g. 'himalayan valley', 'forest waterfall', 'tropical beach cliff'), no place names"}`;
 
-      const g = await callGeminiWithRetry(env, prompt);
+      const g = await callGeminiWithRetry(env, metaPrompt, { schema: META_SCHEMA, maxTokens: 2000 });
       if (!g.text) {
         throw new Error(`Gemini returned no content: ${JSON.stringify(g.error)}`);
       }
-      // Cut-off answer (token limit etc.) -> try again instead of parsing half JSON.
-      if (g.finishReason && g.finishReason !== "STOP") {
-        lastInfo = `finish=${g.finishReason} (answer cut off), len=${g.text.length}`;
-        continue;
-      }
-      const raw = g.text.replace(/```json|```/g, "").trim();
-      let candidate;
+      let meta;
       try {
-        candidate = JSON.parse(raw);
+        meta = JSON.parse(g.text.replace(/```json|```/g, "").trim());
       } catch (e) {
-        lastInfo = `finish=${g.finishReason}, len=${raw.length}, start=${raw.slice(0, 150)}, END=${raw.slice(-200)}`;
+        lastInfo = `bad JSON from Gemini: ${g.text.slice(0, 150)}`;
         continue;
       }
-      if (!candidate.article || !candidate.title) {
+      if (!meta.title || !meta.place_name) {
         lastInfo = "missing fields";
         continue;
       }
-      if (isDuplicate(candidate, usedTitles)) {
-        avoid.push(`${candidate.title} (${candidate.place_name})`);
-        lastInfo = `duplicate place: ${candidate.place_name}`;
+      if (isDuplicate(meta, usedTitles)) {
+        avoid.push(`${meta.title} (${meta.place_name})`);
+        lastInfo = `duplicate place: ${meta.place_name}`;
         continue;
       }
-      parsed = candidate;
+      const art = await writeArticle(env, meta, angle);
+      if (!art.html) {
+        lastInfo = `article failed: ${art.info}`;
+        continue;
+      }
+      parsed = { ...meta, article: art.html };
       break;
     }
     if (!parsed) {
