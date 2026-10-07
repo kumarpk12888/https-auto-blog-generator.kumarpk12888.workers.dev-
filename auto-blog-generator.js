@@ -99,30 +99,45 @@ async function callGeminiWithRetry(env, prompt) {
 
   for (const model of models) {
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              maxOutputTokens: 16000,
-              temperature: 1.0,
-              responseMimeType: "application/json",
-              responseSchema: schema,
-            },
-          }),
+      let retryable = false;
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: {
+                maxOutputTokens: 16000,
+                temperature: 1.0,
+                responseMimeType: "application/json",
+                responseSchema: schema,
+              },
+            }),
+          }
+        );
+        // Read as text first: timeouts like "error code: 524" are NOT JSON.
+        const rawBody = await res.text();
+        let data;
+        try {
+          data = JSON.parse(rawBody);
+        } catch (e) {
+          data = { error: { code: res.status, message: `Non-JSON response (HTTP ${res.status}): ${rawBody.slice(0, 200)}` } };
+          retryable = true;
         }
-      );
-      const data = await res.json();
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      const text = parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
-      if (res.ok && text) {
-        return { text, finishReason: data.candidates?.[0]?.finishReason };
+        const parts = data.candidates?.[0]?.content?.parts || [];
+        const text = parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
+        if (res.ok && text) {
+          return { text, finishReason: data.candidates?.[0]?.finishReason };
+        }
+        lastError = data;
+        if (res.status >= 500 || data.error?.code === 503 || data.error?.code === 429) retryable = true;
+      } catch (e) {
+        lastError = { error: { message: `Gemini fetch failed: ${e.message}` } };
+        retryable = true;
       }
-      lastError = data;
-      if (data.error?.code === 503 || data.error?.code === 429) {
+      if (retryable) {
         await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
       }
@@ -292,7 +307,7 @@ async function getBloggerToken(env) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ client_id: env.CLIENT_ID, client_secret: env.CLIENT_SECRET, refresh_token: env.REFRESH_TOKEN, grant_type: "refresh_token" })
   });
-  const tokenData = await tokenRes.json();
+  const tokenData = await tokenRes.json().catch(() => ({}));
   if (!tokenData.access_token) {
     throw new Error(`Token refresh failed: ${JSON.stringify(tokenData)}`);
   }
@@ -478,7 +493,7 @@ async function generateAndPublish(env, topicTitle, opts = {}) {
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify(postBody)
     });
-    const publishData = await publishRes.json();
+    const publishData = await publishRes.json().catch(() => ({}));
     if (!publishRes.ok) {
       throw new Error(`Blogger publish failed: ${JSON.stringify(publishData)}`);
     }
