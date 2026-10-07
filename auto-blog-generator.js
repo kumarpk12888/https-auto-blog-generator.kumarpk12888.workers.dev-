@@ -1,22 +1,41 @@
 const POSTS_PER_CRON_RUN = 1;
 
+// Optional env variable BLOG_GAP_MINUTES: minimum gap between two blog posts (cron only).
+// Example: 360 = at least 6 hours after the last post on Blogger. Default 0 = no gap check.
 export default {
-  // Visiting the URL publishes only 1 post (for testing).
+  // Visiting the URL publishes only 1 post (for testing, no gap check).
   async fetch(request, env) {
-    return await generateAndPublish(env, getTopicTitle());
+    return await generateAndPublish(env, getTopicTitle(), { checkGap: false });
   },
-  // Cron run publishes 3 posts, each with a different topic.
+  // Cron run publishes POSTS_PER_CRON_RUN posts, each with a different topic.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runBatch(env));
   }
 }
 
 async function runBatch(env) {
-  const topics = pickDistinctTopics(POSTS_PER_CRON_RUN);
-  for (const topic of topics) {
-    const res = await generateAndPublish(env, topic);
-    const out = await res.text();
-    if (!res.ok) console.error(out); else console.log(out);
+  console.log(`CRON start: ${new Date().toISOString()}`);
+  try {
+    const topics = pickDistinctTopics(POSTS_PER_CRON_RUN);
+    for (const topic of topics) {
+      const res = await generateAndPublish(env, topic, { checkGap: true });
+      const out = await res.text();
+      let data = {};
+      try { data = JSON.parse(out); } catch (e) {}
+
+      if (data.status === "skipped") {
+        // "no new blog post" or "gap not over yet"
+        console.log(`CRON result: ${data.reason}`);
+      } else if (res.ok && data.status === "success") {
+        console.log(`CRON result: ${out}`);
+        console.log(`BLOG POST OK: ${data.published_title} -> ${data.post_url}`);
+      } else {
+        console.log(`CRON result: ${out}`);
+        console.error(`BLOG POST FAILED: ${data.error || out}`);
+      }
+    }
+  } catch (e) {
+    console.error(`CRON ERROR: ${e && e.stack ? e.stack : e}`);
   }
 }
 
@@ -284,7 +303,7 @@ async function getBloggerToken(env) {
 async function getRecentTitles(env, accessToken) {
   try {
     const res = await fetch(
-      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(id,title,url,labels)`,
+      `https://www.googleapis.com/blogger/v3/blogs/${env.BLOG_ID}/posts?fetchBodies=false&maxResults=100&fields=items(id,title,url,labels,published)`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -366,13 +385,29 @@ function isDuplicate(parsed, usedTitles) {
   });
 }
 
-async function generateAndPublish(env, topicTitle) {
+function skipped(reason) {
+  return new Response(JSON.stringify({ status: "skipped", reason }, null, 2), { headers: { "Content-Type": "application/json" } });
+}
+
+async function generateAndPublish(env, topicTitle, opts = {}) {
   try {
     // 0) Blogger token + already-published titles (so Gemini never repeats a place).
     const accessToken = await getBloggerToken(env);
     const existingPosts = await getRecentTitles(env, accessToken);
     const usedTitles = existingPosts.map((p) => p.title);
     const avoid = [];
+
+    // Gap check (cron only): skip if the last post on Blogger is too recent.
+    const gapMin = Number(env.BLOG_GAP_MINUTES || 0);
+    if (opts.checkGap && gapMin > 0) {
+      const times = existingPosts.map((p) => Date.parse(p.published)).filter((t) => !isNaN(t));
+      if (times.length) {
+        const passed = (Date.now() - Math.max(...times)) / 60000;
+        if (passed < gapMin) {
+          return skipped(`gap not over yet (${Math.ceil(gapMin - passed)} min left)`);
+        }
+      }
+    }
 
     // 1) Write the article first, so Gemini can also tell us what photos to search for.
     let parsed;
@@ -415,6 +450,7 @@ async function generateAndPublish(env, topicTitle) {
       break;
     }
     if (!parsed) {
+      if (lastInfo.startsWith("duplicate place")) return skipped("no new blog post");
       throw new Error(`Could not get a valid NEW article after 3 tries: ${lastInfo}`);
     }
 
