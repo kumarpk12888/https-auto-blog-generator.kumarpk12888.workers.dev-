@@ -15,7 +15,8 @@ async function runBatch(env) {
   const topics = pickDistinctTopics(POSTS_PER_CRON_RUN);
   for (const topic of topics) {
     const res = await generateAndPublish(env, topic);
-    console.log(await res.text());
+    const out = await res.text();
+    if (!res.ok) console.error(out); else console.log(out);
   }
 }
 
@@ -63,7 +64,6 @@ function pickDistinctTopics(n) {
 async function callGeminiWithRetry(env, prompt) {
   const models = ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
   let lastError;
-  let useThinkingCfg = true; // turned off automatically if the model rejects it
 
   const schema = {
     type: "OBJECT",
@@ -88,11 +88,10 @@ async function callGeminiWithRetry(env, prompt) {
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
-              maxOutputTokens: 32000,
+              maxOutputTokens: 16000,
               temperature: 1.0,
               responseMimeType: "application/json",
               responseSchema: schema,
-              ...(useThinkingCfg ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
             },
           }),
         }
@@ -104,11 +103,6 @@ async function callGeminiWithRetry(env, prompt) {
         return { text, finishReason: data.candidates?.[0]?.finishReason };
       }
       lastError = data;
-      if (data.error?.code === 400 && useThinkingCfg && /think/i.test(data.error?.message || "")) {
-        useThinkingCfg = false; // model does not accept thinkingConfig, retry without it
-        attempt--;
-        continue;
-      }
       if (data.error?.code === 503 || data.error?.code === 429) {
         await new Promise((r) => setTimeout(r, 2000 * attempt));
         continue;
